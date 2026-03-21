@@ -1,0 +1,185 @@
+# CitySports CS-WP9 Treadmill ESPHome Controller
+# ================================================
+# Flash this to an ESP32 to control the treadmill from Home Assistant.
+#
+# Protocol: proprietary BLE (service ffeeddcc-bbaa-9988-7766-554433221100)
+# Packet format: [0xA1] [cmd] [payload...] [XOR checksum]
+#
+# Commands:
+#   Start:        a1 03 01 01 a2
+#   Stop:         a1 03 01 05 a6
+#   Status query: a1 05 00 a4
+#   Set speed:    a1 01 02 01 SS [xor]  (SS = speed * 10, e.g. 0x1e = 3.0 km/h)
+
+esphome:
+  name: treadmill-controller
+  friendly_name: "Treadmill CS-WP9"
+
+esp32:
+  board: esp32dev  # adjust for your board (esp32-s3-devkitc-1, etc.)
+  framework:
+    type: esp-idf  # recommended for BLE client stability
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# --- BLE Client ---
+
+esp32_ble_tracker:
+
+ble_client:
+  - mac_address: !secret treadmill_mac
+    id: treadmill
+    on_connect:
+      then:
+        - logger.log: "Treadmill BLE connected"
+        - delay: 500ms
+        # Enable notifications on the notify characteristic
+        - ble_client.ble_write:
+            id: treadmill
+            service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+            characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221102"
+            # Write to CCCD descriptor to enable notifications
+            # (ESPHome handles this automatically when using notify)
+        # Send status query
+        - ble_client.ble_write:
+            id: treadmill
+            service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+            characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221101"
+            value: [0xA1, 0x05, 0x00, 0xA4]
+    on_disconnect:
+      then:
+        - logger.log: "Treadmill BLE disconnected"
+
+# --- Sensors (read from BLE notifications) ---
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: treadmill
+    name: "Treadmill Target Speed"
+    id: treadmill_target_speed
+    service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+    characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221102"
+    notify: true
+    unit_of_measurement: "km/h"
+    accuracy_decimals: 1
+    icon: "mdi:speedometer"
+    lambda: |-
+      // Parse type-01 status notifications
+      if (x.size() >= 12 && x[0] == 0x1A && x[1] == 0x01) {
+        return x[7] / 10.0f;  // target speed
+      }
+      return {};
+
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: treadmill
+    name: "Treadmill Actual Speed"
+    id: treadmill_actual_speed
+    service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+    characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221102"
+    notify: true
+    unit_of_measurement: "km/h"
+    accuracy_decimals: 1
+    icon: "mdi:speedometer"
+    lambda: |-
+      if (x.size() >= 12 && x[0] == 0x1A && x[1] == 0x01) {
+        return x[4] / 10.0f;  // actual speed
+      }
+      return {};
+
+text_sensor:
+  - platform: ble_client
+    ble_client_id: treadmill
+    name: "Treadmill State"
+    id: treadmill_state
+    service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+    characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221102"
+    notify: true
+    icon: "mdi:run"
+    lambda: |-
+      if (x.size() >= 12 && x[0] == 0x1A && x[1] == 0x01) {
+        uint8_t state = x[9];
+        if (state == 0x01) return std::string("starting");
+        if (state == 0x02) return std::string("running");
+        if (state == 0x05) return std::string("stopping");
+        if (state == 0x06) return std::string("idle");
+        char buf[8];
+        snprintf(buf, sizeof(buf), "0x%02x", state);
+        return std::string(buf);
+      }
+      return {};
+
+# --- Controls ---
+
+button:
+  - platform: template
+    name: "Treadmill Start"
+    icon: "mdi:play"
+    on_press:
+      - ble_client.ble_write:
+          id: treadmill
+          service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+          characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221101"
+          value: [0xA1, 0x03, 0x01, 0x01, 0xA2]
+
+  - platform: template
+    name: "Treadmill Stop"
+    icon: "mdi:stop"
+    on_press:
+      - ble_client.ble_write:
+          id: treadmill
+          service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+          characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221101"
+          value: [0xA1, 0x03, 0x01, 0x05, 0xA6]
+
+number:
+  - platform: template
+    name: "Treadmill Speed"
+    id: treadmill_speed_control
+    icon: "mdi:speedometer"
+    unit_of_measurement: "km/h"
+    min_value: 1.0
+    max_value: 12.0
+    step: 0.1
+    optimistic: true
+    set_action:
+      - lambda: |-
+          uint8_t raw = (uint8_t)(x * 10);
+          uint8_t xor_chk = 0xA1 ^ 0x01 ^ 0x02 ^ 0x01 ^ raw;
+          uint8_t cmd[] = {0xA1, 0x01, 0x02, 0x01, raw, xor_chk};
+          auto write = esp32_ble_tracker::ESPBTUUID::from_raw(
+            (uint8_t[]){0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                        0x99, 0x88, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF});
+      - ble_client.ble_write:
+          id: treadmill
+          service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+          characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221101"
+          # NOTE: ESPHome ble_write doesn't support dynamic values directly.
+          # Use the lambda approach below instead.
+          value: !lambda |-
+            uint8_t raw = (uint8_t)(x * 10);
+            uint8_t xor_chk = 0xA1 ^ 0x01 ^ 0x02 ^ 0x01 ^ raw;
+            return {0xA1, 0x01, 0x02, 0x01, raw, xor_chk};
+
+# --- Periodic status polling (optional, notifications should suffice) ---
+# interval:
+#   - interval: 5s
+#     then:
+#       - ble_client.ble_write:
+#           id: treadmill
+#           service_uuid: "ffeeddcc-bbaa-9988-7766-554433221100"
+#           characteristic_uuid: "ffeeddcc-bbaa-9988-7766-554433221101"
+#           value: [0xA1, 0x05, 0x00, 0xA4]
