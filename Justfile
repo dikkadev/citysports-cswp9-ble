@@ -9,7 +9,7 @@ default:
 # ============================================================================
 
 # Serial port (Windows COM port) — update for your device
-port := "COM9"
+port := "COM12"
 
 # ESP-IDF
 idf_path := env_var_or_default("IDF_PATH", home_directory() + "/esp/esp-idf")
@@ -19,6 +19,9 @@ idf_version := "v5.3.3"
 firmware_dir := "firmware"
 build_dir := firmware_dir + "/build"
 bin_name := "treadmill"
+
+# Speed cap (km/h) — clamped in firmware and quirk UI
+speed_max := env_var_or_default("SPEED_MAX_KMH", "7.5")
 
 # Windows temp for flashing
 win_temp := `cmd.exe /c "echo %TEMP%" 2>/dev/null | tr -d '\r'`
@@ -85,7 +88,7 @@ build: _idf-env
     #!/usr/bin/env bash
     source ~/esp/esp-idf/export.sh
     cd {{firmware_dir}}
-    idf.py build
+    idf.py build -DSPEED_MAX_KMH={{speed_max}}
 
 # Clean build artifacts
 clean: _idf-env

@@ -54,6 +54,11 @@
 // NVS
 #define NVS_NAMESPACE       "treadmill"
 #define NVS_KEY_MAC         "ble_mac"
+#define NVS_KEY_START_SPEED "start_spd"
+
+// Default start speed — sent before START command so the treadmill
+// doesn't always begin at 1.0 km/h (since we lack pause/resume).
+#define DEFAULT_START_SPEED 3.0f
 
 // Startup delay — give treadmill BLE time to start advertising after power-on.
 // The H2 is powered by the treadmill, so both boot simultaneously.
@@ -63,9 +68,12 @@
 #define RECONNECT_MIN_MS    3000
 #define RECONNECT_MAX_MS    30000
 
-// Speed limits
+// Speed limits — SPEED_MAX_KMH can be overridden at build time via
+// idf.py build -DSPEED_MAX_KMH=7.5  (or set in Justfile)
 #define SPEED_MIN_KMH       1.0f
-#define SPEED_MAX_KMH       12.0f
+#ifndef SPEED_MAX_KMH
+#define SPEED_MAX_KMH       7.5f
+#endif
 
 // Command queue depth
 #define CMD_QUEUE_SIZE      8
@@ -171,6 +179,7 @@ static float g_reported_speed = 0.0f;
 // Configuration
 static char g_ble_mac[18] = "";   // "XX:XX:XX:XX:XX:XX"
 static bool g_mac_configured = false;
+static float g_start_speed = DEFAULT_START_SPEED;
 
 // FreeRTOS primitives
 static QueueHandle_t g_cmd_queue = NULL;
@@ -252,13 +261,27 @@ static void parse_notification(const uint8_t *data, size_t len)
 // MAC Address Helpers
 // ============================================================================
 
+// Parse MAC in either format: "70:19:88:B2:1C:EA" or "701988B21CEA"
 static bool parse_mac(const char *str, ble_addr_t *addr)
 {
     unsigned int b[6];
-    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
-               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
-        return false;
 
+    // Try colon-separated first
+    if (sscanf(str, "%02x:%02x:%02x:%02x:%02x:%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        goto ok;
+    }
+
+    // Try compact (no colons)
+    if (strlen(str) == 12 &&
+        sscanf(str, "%02x%02x%02x%02x%02x%02x",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        goto ok;
+    }
+
+    return false;
+
+ok:
     addr->type = BLE_ADDR_PUBLIC;
     for (int i = 0; i < 6; i++)
         addr->val[5 - i] = (uint8_t)b[i];
@@ -286,6 +309,13 @@ static void load_config_from_nvs(void)
         }
     }
 
+    // Start speed (stored as uint16 = speed * 10)
+    uint16_t spd_raw;
+    if (nvs_get_u16(h, NVS_KEY_START_SPEED, &spd_raw) == ESP_OK) {
+        g_start_speed = spd_raw / 10.0f;
+        ESP_LOGI(TAG, "Loaded start speed: %.1f km/h", g_start_speed);
+    }
+
     nvs_close(h);
 }
 
@@ -297,6 +327,17 @@ static void save_mac_to_nvs(void)
     nvs_commit(h);
     nvs_close(h);
     ESP_LOGI(TAG, "MAC saved to NVS");
+}
+
+static void save_start_speed_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    uint16_t raw = (uint16_t)(g_start_speed * 10.0f + 0.5f);
+    nvs_set_u16(h, NVS_KEY_START_SPEED, raw);
+    nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "Start speed saved: %.1f km/h", g_start_speed);
 }
 
 // ============================================================================
@@ -569,15 +610,15 @@ static void sync_zigbee_state(void)
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on_off_val, false);
 
-    // Speed
-    esp_zb_zcl_set_attribute_val(TREADMILL_ENDPOINT,
-        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID, &spd, false);
-
-    // State code
+    // Speed (Analog Value)
     esp_zb_zcl_set_attribute_val(TREADMILL_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID, &state_f, false);
+        ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID, &spd, false);
+
+    // State code (Analog Input)
+    esp_zb_zcl_set_attribute_val(TREADMILL_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &state_f, false);
 
     esp_zb_lock_release();
 
@@ -586,12 +627,12 @@ static void sync_zigbee_state(void)
     if (state_changed) {
         report_attr(ESP_ZB_ZCL_CLUSTER_ID_ON_OFF,
                     ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID);
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE,
-                    ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID);
+        report_attr(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                    ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
     }
     if (speed_changed) {
-        report_attr(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT,
-                    ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID);
+        report_attr(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE,
+                    ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID);
     }
 }
 
@@ -653,22 +694,35 @@ static esp_err_t zb_attr_handler(const esp_zb_zcl_set_attr_value_message_t *msg)
     ESP_LOGI(TAG, "Zigbee write: cluster=0x%04x attr=0x%04x",
              msg->info.cluster, msg->attribute.id);
 
-    // On/Off → start / stop
+    // On/Off → start (with default speed) / stop
     if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         msg->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
         bool on = *(uint8_t *)msg->attribute.data.value;
-        treadmill_cmd_t cmd = { .type = on ? CMD_START : CMD_STOP };
-        xQueueSend(g_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+        if (on) {
+            // Send speed BEFORE start — treadmill resets to 1.0 on stop,
+            // and we don't have pause/resume yet.
+            treadmill_cmd_t spd = { .type = CMD_SET_SPEED,
+                                    .speed_kmh = g_start_speed };
+            xQueueSend(g_cmd_queue, &spd, pdMS_TO_TICKS(100));
+            treadmill_cmd_t start = { .type = CMD_START };
+            xQueueSend(g_cmd_queue, &start, pdMS_TO_TICKS(100));
+        } else {
+            treadmill_cmd_t stop = { .type = CMD_STOP };
+            xQueueSend(g_cmd_queue, &stop, pdMS_TO_TICKS(100));
+        }
     }
 
-    // Analog Output → set speed
-    if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_OUTPUT &&
-        msg->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_PRESENT_VALUE_ID) {
+    // Analog Value → set speed (also saves as default start speed)
+    if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE &&
+        msg->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID) {
         float speed = *(float *)msg->attribute.data.value;
         if (speed < SPEED_MIN_KMH) speed = SPEED_MIN_KMH;
         if (speed > SPEED_MAX_KMH) speed = SPEED_MAX_KMH;
         treadmill_cmd_t cmd = { .type = CMD_SET_SPEED, .speed_kmh = speed };
         xQueueSend(g_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+        // Save as default start speed
+        g_start_speed = speed;
+        save_start_speed_to_nvs();
     }
 
     // Basic.location_description → BLE MAC configuration
@@ -676,7 +730,7 @@ static esp_err_t zb_attr_handler(const esp_zb_zcl_set_attr_value_message_t *msg)
         msg->attribute.id == ESP_ZB_ZCL_ATTR_BASIC_LOCATION_DESCRIPTION_ID) {
         const uint8_t *data = msg->attribute.data.value;
         uint8_t len = data[0];  // ZCL string: length byte + chars
-        if (len >= 17 && len < sizeof(g_ble_mac)) {
+        if (len >= 12 && len < sizeof(g_ble_mac)) {
             memcpy(g_ble_mac, &data[1], len);
             g_ble_mac[len] = '\0';
             ble_addr_t tmp;
@@ -742,28 +796,28 @@ static esp_zb_cluster_list_t *create_clusters(void)
     esp_zb_cluster_list_add_on_off_cluster(list,
         esp_zb_on_off_cluster_create(&onoff_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    // --- Analog Output (speed control, writable) ---
-    esp_zb_analog_output_cluster_cfg_t ao_cfg = {
-        .out_of_service = false,
-        .present_value = SPEED_MIN_KMH,
-    };
-    esp_zb_attribute_list_t *ao = esp_zb_analog_output_cluster_create(&ao_cfg);
-    static char ao_desc[] = "\x0C""Speed (km/h)";
-    esp_zb_analog_output_cluster_add_attr(ao,
-        ESP_ZB_ZCL_ATTR_ANALOG_OUTPUT_DESCRIPTION_ID, ao_desc);
-    esp_zb_cluster_list_add_analog_output_cluster(list, ao,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-
-    // --- Analog Value (state code, read-only reporting) ---
+    // --- Analog Value (speed control, writable) ---
     esp_zb_analog_value_cluster_cfg_t av_cfg = {
         .out_of_service = false,
-        .present_value = (float)STATE_IDLE,
+        .present_value = g_start_speed,
     };
     esp_zb_attribute_list_t *av = esp_zb_analog_value_cluster_create(&av_cfg);
-    static char av_desc[] = "\x05""State";
+    static char av_desc[] = "\x0C""Speed (km/h)";
     esp_zb_analog_value_cluster_add_attr(av,
         ESP_ZB_ZCL_ATTR_ANALOG_VALUE_DESCRIPTION_ID, av_desc);
     esp_zb_cluster_list_add_analog_value_cluster(list, av,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    // --- Analog Input (state code, read-only reporting) ---
+    esp_zb_analog_input_cluster_cfg_t ai_cfg = {
+        .out_of_service = false,
+        .present_value = (float)STATE_IDLE,
+    };
+    esp_zb_attribute_list_t *ai = esp_zb_analog_input_cluster_create(&ai_cfg);
+    static char ai_desc[] = "\x05""State";
+    esp_zb_analog_input_cluster_add_attr(ai,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, ai_desc);
+    esp_zb_cluster_list_add_analog_input_cluster(list, ai,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     return list;

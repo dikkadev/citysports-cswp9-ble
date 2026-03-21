@@ -11,44 +11,40 @@ Restart Home Assistant and reconfigure the device.
 
 Entities created:
   - Switch: Treadmill On/Off (auto-discovered from On/Off cluster)
-  - Number: Treadmill Speed (Analog Output, 1.0–12.0 km/h, step 0.1)
-  - Sensor: Treadmill State (Analog Value, state codes: 1=starting, 2=running, 5=stopping, 6=idle)
-  - Button: Treadmill BLE MAC (Basic.location_description, write-once config)
+  - Number: Treadmill Speed (Analog Value, 1.0-12.0 km/h, step 0.1)
+  - Sensor: Treadmill State (Analog Input, state codes: 1=starting, 2=running, 5=stopping, 6=idle)
+
+BLE MAC is configured via the ZHA cluster UI (Basic > location_description).
 """
 
 from zigpy.quirks.v2 import QuirkBuilder
-from zigpy.zcl.clusters.general import AnalogOutput, AnalogValue, Basic
+from zigpy.zcl.clusters.general import AnalogInput, AnalogValue
 
 
 (
     QuirkBuilder("ESPRESSIF", "TREADMILL")
-    # Speed control (Analog Output cluster)
+    # Speed control (Analog Value cluster)
     .number(
-        AnalogOutput.AttributeDefs.present_value.name,
-        AnalogOutput.cluster_id,
+        AnalogValue.AttributeDefs.present_value.name,
+        AnalogValue.cluster_id,
+        endpoint_id=1,
         min_value=1.0,
-        max_value=12.0,
+        max_value=7.5,
         step=0.1,
         unit="km/h",
         translation_key="treadmill_speed",
         fallback_name="Treadmill Speed",
     )
-    # State code (Analog Value cluster) — read-only sensor
+    # State code (Analog Input cluster)
     .number(
-        AnalogValue.AttributeDefs.present_value.name,
-        AnalogValue.cluster_id,
+        AnalogInput.AttributeDefs.present_value.name,
+        AnalogInput.cluster_id,
+        endpoint_id=1,
         min_value=0,
         max_value=10,
         step=1,
         translation_key="treadmill_state",
         fallback_name="Treadmill State",
-    )
-    # BLE MAC address configuration (Basic.location_description)
-    .write_attr_button(
-        Basic.AttributeDefs.location_description.name,
-        Basic.cluster_id,
-        translation_key="treadmill_ble_mac",
-        fallback_name="Treadmill BLE MAC",
     )
     .add_to_registry()
 )
