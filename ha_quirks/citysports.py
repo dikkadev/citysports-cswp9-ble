@@ -11,19 +11,21 @@ Restart Home Assistant and reconfigure the device.
 
 Entities created:
   - Switch: Treadmill On/Off (auto-discovered from On/Off cluster)
-  - Number: Treadmill Speed (Analog Value, 1.0-12.0 km/h, step 0.1)
-  - Sensor: Treadmill State (Analog Input, state codes: 1=starting, 2=running, 5=stopping, 6=idle)
+  - Number: Treadmill Speed (EP1, Analog Value, 1.0-7.5 km/h, step 0.1)
+  - Number: Default Start Speed (EP2, Analog Value, 1.0-7.5 km/h, step 0.1)
+  - Sensor: Treadmill State (EP1, Analog Input, auto-discovered)
 
+Speed values stored as x10 in ZCL (multiplier=0.1 converts to km/h).
 BLE MAC is configured via the ZHA cluster UI (Basic > location_description).
 """
 
 from zigpy.quirks.v2 import QuirkBuilder
-from zigpy.zcl.clusters.general import AnalogInput, AnalogValue
+from zigpy.zcl.clusters.general import AnalogValue
 
 
 (
     QuirkBuilder("ESPRESSIF", "TREADMILL")
-    # Speed control (Analog Value cluster)
+    # Speed control (EP1 Analog Value, stored as x10)
     .number(
         AnalogValue.AttributeDefs.present_value.name,
         AnalogValue.cluster_id,
@@ -32,19 +34,22 @@ from zigpy.zcl.clusters.general import AnalogInput, AnalogValue
         max_value=7.5,
         step=0.1,
         unit="km/h",
+        multiplier=0.1,
         translation_key="treadmill_speed",
         fallback_name="Treadmill Speed",
     )
-    # State code (Analog Input cluster)
+    # Default start speed (EP2 Analog Value, stored as x10)
     .number(
-        AnalogInput.AttributeDefs.present_value.name,
-        AnalogInput.cluster_id,
-        endpoint_id=1,
-        min_value=0,
-        max_value=10,
-        step=1,
-        translation_key="treadmill_state",
-        fallback_name="Treadmill State",
+        AnalogValue.AttributeDefs.present_value.name,
+        AnalogValue.cluster_id,
+        endpoint_id=2,
+        min_value=1.0,
+        max_value=7.5,
+        step=0.1,
+        unit="km/h",
+        multiplier=0.1,
+        translation_key="treadmill_start_speed",
+        fallback_name="Default Start Speed",
     )
     .add_to_registry()
 )

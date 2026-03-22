@@ -48,6 +48,7 @@
 
 // Zigbee
 #define TREADMILL_ENDPOINT  1
+#define CONFIG_ENDPOINT     2
 #define MANUFACTURER_NAME   "\x09""ESPRESSIF"
 #define MODEL_ID            "\x09""TREADMILL"
 
@@ -180,6 +181,9 @@ static float g_reported_speed = 0.0f;
 static char g_ble_mac[18] = "";   // "XX:XX:XX:XX:XX:XX"
 static bool g_mac_configured = false;
 static float g_start_speed = DEFAULT_START_SPEED;
+
+// Pending speed: set after START, applied once treadmill reaches RUNNING state
+static float g_pending_speed = 0;
 
 // FreeRTOS primitives
 static QueueHandle_t g_cmd_queue = NULL;
@@ -610,10 +614,11 @@ static void sync_zigbee_state(void)
         ESP_ZB_ZCL_CLUSTER_ID_ON_OFF, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
         ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID, &on_off_val, false);
 
-    // Speed (Analog Value)
+    // Speed (Analog Value) — stored as ×10 for integer precision
+    float spd_raw = spd * 10.0f;
     esp_zb_zcl_set_attribute_val(TREADMILL_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID, &spd, false);
+        ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID, &spd_raw, false);
 
     // State code (Analog Input)
     esp_zb_zcl_set_attribute_val(TREADMILL_ENDPOINT,
@@ -694,35 +699,43 @@ static esp_err_t zb_attr_handler(const esp_zb_zcl_set_attr_value_message_t *msg)
     ESP_LOGI(TAG, "Zigbee write: cluster=0x%04x attr=0x%04x",
              msg->info.cluster, msg->attribute.id);
 
-    // On/Off → start (with default speed) / stop
+    // On/Off → start / stop
     if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
         msg->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
         bool on = *(uint8_t *)msg->attribute.data.value;
         if (on) {
-            // Send speed BEFORE start — treadmill resets to 1.0 on stop,
-            // and we don't have pause/resume yet.
-            treadmill_cmd_t spd = { .type = CMD_SET_SPEED,
-                                    .speed_kmh = g_start_speed };
-            xQueueSend(g_cmd_queue, &spd, pdMS_TO_TICKS(100));
+            // Send START, then wait for RUNNING state before setting speed.
+            // The treadmill has a 3s countdown and always starts at 1.0 km/h.
             treadmill_cmd_t start = { .type = CMD_START };
             xQueueSend(g_cmd_queue, &start, pdMS_TO_TICKS(100));
+            g_pending_speed = g_start_speed;
+            ESP_LOGI(TAG, "Will set %.1f km/h once running", g_pending_speed);
         } else {
+            g_pending_speed = 0;
             treadmill_cmd_t stop = { .type = CMD_STOP };
             xQueueSend(g_cmd_queue, &stop, pdMS_TO_TICKS(100));
         }
     }
 
-    // Analog Value → set speed (also saves as default start speed)
+    // Analog Value → speed control (EP1) or start speed config (EP2)
+    // Values stored as ×10 in ZCL for integer precision (quirk uses multiplier=0.1)
     if (msg->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_VALUE &&
         msg->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_VALUE_PRESENT_VALUE_ID) {
-        float speed = *(float *)msg->attribute.data.value;
+        float raw = *(float *)msg->attribute.data.value;
+        float speed = raw / 10.0f;
         if (speed < SPEED_MIN_KMH) speed = SPEED_MIN_KMH;
         if (speed > SPEED_MAX_KMH) speed = SPEED_MAX_KMH;
-        treadmill_cmd_t cmd = { .type = CMD_SET_SPEED, .speed_kmh = speed };
-        xQueueSend(g_cmd_queue, &cmd, pdMS_TO_TICKS(100));
-        // Save as default start speed
-        g_start_speed = speed;
-        save_start_speed_to_nvs();
+
+        if (msg->info.dst_endpoint == TREADMILL_ENDPOINT) {
+            // Live speed change
+            treadmill_cmd_t cmd = { .type = CMD_SET_SPEED, .speed_kmh = speed };
+            xQueueSend(g_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+        } else if (msg->info.dst_endpoint == CONFIG_ENDPOINT) {
+            // Default start speed config
+            g_start_speed = speed;
+            save_start_speed_to_nvs();
+            ESP_LOGI(TAG, "Default start speed: %.1f km/h", speed);
+        }
     }
 
     // Basic.location_description → BLE MAC configuration
@@ -796,10 +809,10 @@ static esp_zb_cluster_list_t *create_clusters(void)
     esp_zb_cluster_list_add_on_off_cluster(list,
         esp_zb_on_off_cluster_create(&onoff_cfg), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
-    // --- Analog Value (speed control, writable) ---
+    // --- Analog Value (speed control, writable, stored as ×10) ---
     esp_zb_analog_value_cluster_cfg_t av_cfg = {
         .out_of_service = false,
-        .present_value = g_start_speed,
+        .present_value = g_start_speed * 10.0f,
     };
     esp_zb_attribute_list_t *av = esp_zb_analog_value_cluster_create(&av_cfg);
     static char av_desc[] = "\x0C""Speed (km/h)";
@@ -823,15 +836,58 @@ static esp_zb_cluster_list_t *create_clusters(void)
     return list;
 }
 
-static esp_zb_ep_list_t *create_endpoint(void)
+// EP2: default start speed configuration
+static esp_zb_cluster_list_t *create_config_clusters(void)
+{
+    esp_zb_cluster_list_t *list = esp_zb_zcl_cluster_list_create();
+
+    // Basic
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *basic = esp_zb_basic_cluster_create(&basic_cfg);
+    static char cfg_model[] = "\x09""TREAD_CFG";
+    esp_zb_basic_cluster_add_attr(basic,
+        ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)cfg_model);
+    esp_zb_cluster_list_add_basic_cluster(list, basic,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    // Analog Value (default start speed, stored as ×10)
+    esp_zb_analog_value_cluster_cfg_t av_cfg = {
+        .out_of_service = false,
+        .present_value = g_start_speed * 10.0f,
+    };
+    esp_zb_attribute_list_t *av = esp_zb_analog_value_cluster_create(&av_cfg);
+    static char av_desc[] = "\x0B""Start Speed";
+    esp_zb_analog_value_cluster_add_attr(av,
+        ESP_ZB_ZCL_ATTR_ANALOG_VALUE_DESCRIPTION_ID, av_desc);
+    esp_zb_cluster_list_add_analog_value_cluster(list, av,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    return list;
+}
+
+static esp_zb_ep_list_t *create_endpoints(void)
 {
     esp_zb_ep_list_t *ep = esp_zb_ep_list_create();
-    esp_zb_endpoint_config_t cfg = {
+
+    // EP1: treadmill control
+    esp_zb_endpoint_config_t ep1_cfg = {
         .endpoint = TREADMILL_ENDPOINT,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .app_device_id = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID,
     };
-    esp_zb_ep_list_add_ep(ep, create_clusters(), cfg);
+    esp_zb_ep_list_add_ep(ep, create_clusters(), ep1_cfg);
+
+    // EP2: configuration (default start speed)
+    esp_zb_endpoint_config_t ep2_cfg = {
+        .endpoint = CONFIG_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+    };
+    esp_zb_ep_list_add_ep(ep, create_config_clusters(), ep2_cfg);
+
     return ep;
 }
 
@@ -897,6 +953,16 @@ static void bridge_task(void *p)
         if (bits & EVT_TREADMILL_UPDATE) {
             reconnect_ms = RECONNECT_MIN_MS;  // activity = reset backoff
             sync_zigbee_state();
+
+            // Apply pending start speed once treadmill reaches RUNNING
+            if (g_pending_speed > 0 && g_state == STATE_RUNNING) {
+                ESP_LOGI(TAG, "Running — setting start speed %.1f km/h",
+                         g_pending_speed);
+                treadmill_cmd_t cmd = { .type = CMD_SET_SPEED,
+                                        .speed_kmh = g_pending_speed };
+                xQueueSend(g_cmd_queue, &cmd, pdMS_TO_TICKS(100));
+                g_pending_speed = 0;
+            }
         }
 
         // Drain command queue
@@ -936,7 +1002,7 @@ static void zigbee_task(void *p)
 {
     esp_zb_cfg_t cfg = ESP_ZB_ZED_CONFIG();
     esp_zb_init(&cfg);
-    esp_zb_device_register(create_endpoint());
+    esp_zb_device_register(create_endpoints());
     esp_zb_core_action_handler_register(zb_action_handler);
     esp_zb_set_primary_network_channel_set(ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
