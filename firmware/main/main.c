@@ -954,6 +954,13 @@ static void bridge_task(void *p)
             reconnect_ms = RECONNECT_MIN_MS;  // activity = reset backoff
             sync_zigbee_state();
 
+            // Clear pending speed if treadmill went idle (e.g. stopped
+            // from handlebar during countdown)
+            if (g_pending_speed > 0 && g_state == STATE_IDLE) {
+                ESP_LOGI(TAG, "Stopped — clearing pending speed");
+                g_pending_speed = 0;
+            }
+
             // Apply pending start speed once treadmill reaches RUNNING
             if (g_pending_speed > 0 && g_state == STATE_RUNNING) {
                 ESP_LOGI(TAG, "Running — setting start speed %.1f km/h",
